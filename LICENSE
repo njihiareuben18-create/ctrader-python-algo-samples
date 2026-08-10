@@ -1,21 +1,332 @@
-MIT License
+# selective_reversal_cbot.py
 
-Copyright (c) 2025 Spotware
+import numpy as np
+import pandas as pd
+from ctrader_open_api import *
+from typing import Dict, Any, List, Optional
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
-
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
-
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+class SelectiveReversalBot(CustomBot):
+    """
+    Selective Reversal Strategy - Python implementation for cTrader
+    Combines RSI, Stochastic, EMA trend filter, and volume confirmation
+    """
+    
+    # --- Input Parameters ---
+    rsi_len: int = 14
+    stoch_k_len: int = 14
+    stoch_smooth_k: int = 5
+    stoch_smooth_d: int = 3
+    ema_len: int = 50
+    atr_len: int = 14
+    atr_mult_sl: float = 1.0
+    atr_mult_tp: float = 1.5
+    rsi_overbought: int = 70
+    rsi_oversold: int = 30
+    stoch_overbought: int = 80
+    stoch_oversold: int = 20
+    vol_sma_len: int = 20
+    base_margin_pct: float = 0.10  # 10% of equity per trade
+    
+    def __init__(self):
+        super().__init__()
+        # State variables for RSI persistence
+        self.prev_rsi = []
+        self.last_rsi_1 = None
+        self.last_rsi_2 = None
+        self.last_rsi_3 = None
+        
+    def on_start(self):
+        """Initialize when bot starts"""
+        self.log("Selective Reversal Bot started")
+        
+    def on_bar(self):
+        """Main logic runs on each new bar/candle"""
+        
+        # --- Get OHLCV data ---
+        bars = self.bars  # Get current bar data
+        if len(bars) < max(self.ema_len, self.vol_sma_len, self.rsi_len, self.stoch_k_len + self.stoch_smooth_d):
+            return  # Not enough data yet
+            
+        # Convert to lists for calculations
+        close_prices = [bar.close for bar in bars]
+        high_prices = [bar.high for bar in bars]
+        low_prices = [bar.low for bar in bars]
+        volumes = [bar.volume for bar in bars]
+        
+        current_close = close_prices[-1]
+        current_high = high_prices[-1]
+        current_low = low_prices[-1]
+        current_volume = volumes[-1]
+        
+        # --- Calculate Indicators ---
+        
+        # 1. RSI (14)
+        rsi_values = self.calculate_rsi(close_prices, self.rsi_len)
+        current_rsi = rsi_values[-1] if rsi_values else None
+        
+        # 2. Stochastic (14, 5, 3)
+        stoch_k, stoch_d = self.calculate_stochastic(high_prices, low_prices, close_prices, 
+                                                     self.stoch_k_len, self.stoch_smooth_k, self.stoch_smooth_d)
+        current_k = stoch_k[-1] if stoch_k else None
+        current_d = stoch_d[-1] if stoch_d else None
+        prev_k = stoch_k[-2] if len(stoch_k) > 1 else None
+        prev_d = stoch_d[-2] if len(stoch_d) > 1 else None
+        
+        # 3. EMA (50)
+        ema_values = self.calculate_ema(close_prices, self.ema_len)
+        current_ema = ema_values[-1] if ema_values else None
+        
+        # 4. ATR (14)
+        atr_values = self.calculate_atr(high_prices, low_prices, close_prices, self.atr_len)
+        current_atr = atr_values[-1] if atr_values else None
+        
+        # 5. Volume SMA
+        vol_sma_values = self.calculate_sma(volumes, self.vol_sma_len)
+        current_vol_sma = vol_sma_values[-1] if vol_sma_values else None
+        
+        # --- Check if all indicators are valid ---
+        if None in [current_rsi, current_k, current_d, current_ema, current_atr, current_vol_sma]:
+            return
+            
+        # --- Update state for RSI persistence ---
+        self.update_rsi_state(current_rsi)
+        
+        # --- Volume Confirmation ---
+        volume_confirmed = current_volume > current_vol_sma
+        
+        # --- Trend Filter ---
+        uptrend = current_close > current_ema
+        downtrend = current_close < current_ema
+        
+        # --- RSI Persistence (3 bars overbought/oversold) ---
+        rsi_overbought_3bars = (self.last_rsi_1 >= self.rsi_overbought and 
+                               self.last_rsi_2 >= self.rsi_overbought and 
+                               self.last_rsi_3 >= self.rsi_overbought)
+        
+        rsi_oversold_3bars = (self.last_rsi_1 <= self.rsi_oversold and 
+                             self.last_rsi_2 <= self.rsi_oversold and 
+                             self.last_rsi_3 <= self.rsi_oversold)
+        
+        # --- Stochastic Calculations ---
+        # Bearish cross: K crosses below D
+        stoch_bearish_cross = (prev_k > prev_d and current_k <= current_d)
+        
+        # Overbought exhaustion
+        stoch_overbought_exhaustion = (current_k >= self.stoch_overbought and 
+                                      current_d >= self.stoch_overbought and 
+                                      prev_k > prev_d)
+        
+        # Bullish cross: K crosses above D
+        stoch_bullish_cross = (prev_k < prev_d and current_k >= current_d)
+        
+        # Oversold exhaustion
+        stoch_oversold_exhaustion = (current_k <= self.stoch_oversold and 
+                                    current_d <= self.stoch_oversold and 
+                                    prev_k < prev_d)
+        
+        # --- RSI Rolling Over / Rising from Trough ---
+        rsi_rolling_over = current_rsi < self.last_rsi_1 and (self.last_rsi_1 > self.last_rsi_2 or current_rsi < self.last_rsi_2)
+        rsi_rising_from_trough = current_rsi > self.last_rsi_1 and (self.last_rsi_1 < self.last_rsi_2 or current_rsi > self.last_rsi_2)
+        
+        # --- Entry Signals ---
+        short_signal = (uptrend and rsi_overbought_3bars and stoch_overbought_exhaustion and 
+                       stoch_bearish_cross and rsi_rolling_over and volume_confirmed)
+        
+        long_signal = (downtrend and rsi_oversold_3bars and stoch_oversold_exhaustion and 
+                      stoch_bullish_cross and rsi_rising_from_trough and volume_confirmed)
+        
+        # --- Check if in position ---
+        position = self.position_manager.get_position(self.symbol_name)
+        in_position = position is not None
+        
+        # --- Execute Short Entry ---
+        if not in_position and short_signal:
+            self.log(f"SHORT SIGNAL: RSI={current_rsi:.2f}, K={current_k:.2f}, D={current_d:.2f}, EMA={current_ema:.4f}")
+            
+            entry = current_close
+            sl = entry + (self.atr_mult_sl * current_atr)
+            tp = entry - (self.atr_mult_tp * current_atr)
+            
+            # Calculate position size (10% of equity)
+            equity = self.account_manager.get_equity()
+            risk_amount = equity * self.base_margin_pct
+            qty = int(risk_amount / entry)  # Simplified - adjust for your broker's margin requirements
+            
+            if qty > 0:
+                self.position_manager.execute_order(
+                    symbol=self.symbol_name,
+                    trade_type=TradeType.SELL,
+                    volume=qty,
+                    stop_loss=sl,
+                    take_profit=tp,
+                    label="Short Entry"
+                )
+                self.log(f"Short entry at {entry:.4f}, SL={sl:.4f}, TP={tp:.4f}")
+        
+        # --- Execute Long Entry ---
+        elif not in_position and long_signal:
+            self.log(f"LONG SIGNAL: RSI={current_rsi:.2f}, K={current_k:.2f}, D={current_d:.2f}, EMA={current_ema:.4f}")
+            
+            entry = current_close
+            sl = entry - (self.atr_mult_sl * current_atr)
+            tp = entry + (self.atr_mult_tp * current_atr)
+            
+            # Calculate position size (10% of equity)
+            equity = self.account_manager.get_equity()
+            risk_amount = equity * self.base_margin_pct
+            qty = int(risk_amount / entry)  # Simplified - adjust for your broker's margin requirements
+            
+            if qty > 0:
+                self.position_manager.execute_order(
+                    symbol=self.symbol_name,
+                    trade_type=TradeType.BUY,
+                    volume=qty,
+                    stop_loss=sl,
+                    take_profit=tp,
+                    label="Long Entry"
+                )
+                self.log(f"Long entry at {entry:.4f}, SL={sl:.4f}, TP={tp:.4f}")
+        
+    # --- Indicator Calculation Methods ---
+    
+    def calculate_rsi(self, prices: List[float], period: int) -> List[float]:
+        """Calculate RSI indicator"""
+        if len(prices) < period + 1:
+            return []
+            
+        rsi_values = []
+        gains = []
+        losses = []
+        
+        # Calculate price changes
+        for i in range(1, len(prices)):
+            change = prices[i] - prices[i-1]
+            gains.append(max(change, 0))
+            losses.append(max(-change, 0))
+        
+        # Initial average
+        avg_gain = sum(gains[:period]) / period
+        avg_loss = sum(losses[:period]) / period
+        
+        if avg_loss == 0:
+            return [100] * (len(prices) - period)
+            
+        rs = avg_gain / avg_loss
+        rsi_values.append(100 - (100 / (1 + rs)))
+        
+        # Subsequent values (Wilder's smoothing)
+        for i in range(period, len(gains)):
+            avg_gain = ((avg_gain * (period - 1)) + gains[i]) / period
+            avg_loss = ((avg_loss * (period - 1)) + losses[i]) / period
+            
+            if avg_loss == 0:
+                rsi_values.append(100)
+            else:
+                rs = avg_gain / avg_loss
+                rsi_values.append(100 - (100 / (1 + rs)))
+        
+        return rsi_values
+    
+    def calculate_stochastic(self, highs: List[float], lows: List[float], closes: List[float], 
+                            k_period: int, smooth_k: int, smooth_d: int) -> tuple:
+        """Calculate Stochastic %K and %D"""
+        if len(closes) < k_period:
+            return [], []
+            
+        k_values = []
+        
+        # Calculate %K raw values
+        for i in range(k_period - 1, len(closes)):
+            period_high = max(highs[i - k_period + 1:i + 1])
+            period_low = min(lows[i - k_period + 1:i + 1])
+            
+            if period_high == period_low:
+                k_raw = 50
+            else:
+                k_raw = 100 * ((closes[i] - period_low) / (period_high - period_low))
+            k_values.append(k_raw)
+        
+        # Smooth %K
+        if len(k_values) < smooth_k:
+            return [], []
+            
+        k_smooth = []
+        for i in range(smooth_k - 1, len(k_values)):
+            k_smooth.append(sum(k_values[i - smooth_k + 1:i + 1]) / smooth_k)
+        
+        # Calculate %D (smooth of %K)
+        if len(k_smooth) < smooth_d:
+            return k_smooth, []
+            
+        d_smooth = []
+        for i in range(smooth_d - 1, len(k_smooth)):
+            d_smooth.append(sum(k_smooth[i - smooth_d + 1:i + 1]) / smooth_d)
+        
+        return k_smooth, d_smooth
+    
+    def calculate_ema(self, prices: List[float], period: int) -> List[float]:
+        """Calculate Exponential Moving Average"""
+        if len(prices) < period:
+            return []
+            
+        ema_values = []
+        multiplier = 2 / (period + 1)
+        
+        # Initial SMA
+        initial_sma = sum(prices[:period]) / period
+        ema_values.append(initial_sma)
+        
+        # EMA calculation
+        for i in range(period, len(prices)):
+            ema = (prices[i] * multiplier) + (ema_values[-1] * (1 - multiplier))
+            ema_values.append(ema)
+        
+        return ema_values
+    
+    def calculate_atr(self, highs: List[float], lows: List[float], closes: List[float], period: int) -> List[float]:
+        """Calculate Average True Range"""
+        if len(closes) < period + 1:
+            return []
+            
+        tr_values = []
+        
+        # True Range calculation
+        for i in range(1, len(closes)):
+            tr = max(highs[i] - lows[i], abs(highs[i] - closes[i-1]), abs(lows[i] - closes[i-1]))
+            tr_values.append(tr)
+        
+        if len(tr_values) < period:
+            return []
+            
+        # Initial ATR (SMA of TR)
+        atr_values = [sum(tr_values[:period]) / period]
+        
+        # Subsequent ATR (Wilder's smoothing)
+        for i in range(period, len(tr_values)):
+            atr = ((atr_values[-1] * (period - 1)) + tr_values[i]) / period
+            atr_values.append(atr)
+        
+        return atr_values
+    
+    def calculate_sma(self, values: List[float], period: int) -> List[float]:
+        """Calculate Simple Moving Average"""
+        if len(values) < period:
+            return []
+            
+        sma_values = []
+        for i in range(period - 1, len(values)):
+            sma = sum(values[i - period + 1:i + 1]) / period
+            sma_values.append(sma)
+        
+        return sma_values
+    
+    def update_rsi_state(self, current_rsi: float):
+        """Update RSI state for persistence checking"""
+        if self.last_rsi_3 is None:
+            self.last_rsi_3 = current_rsi
+            self.last_rsi_2 = current_rsi
+            self.last_rsi_1 = current_rsi
+        else:
+            self.last_rsi_3 = self.last_rsi_2
+            self.last_rsi_2 = self.last_rsi_1
+            self.last_rsi_1 = current_rsi
